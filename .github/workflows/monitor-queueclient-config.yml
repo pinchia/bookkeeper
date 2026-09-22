@@ -1,0 +1,320 @@
+name: Monitor and archive Queue-it configuration
+
+on:
+  schedule:
+    # Normal cadence: every 30 minutes during the UTC dates that overlap the
+    # requested 2026 monitoring window in Asia/Taipei.
+    - cron: "17,47 * 22-30 9 *"
+
+    # Elevated cadence: every 5 minutes for 2026-09-26 05:00-17:00
+    # Asia/Taipei, equal to 2026-09-25 21:00 through 2026-09-26 09:00 UTC.
+    - cron: "2-57/5 21-23 25 9 *"
+    - cron: "2-57/5 0-8 26 9 *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: queue-it-config-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      TARGET_URL: https://assets.queue-it.net/ibontaiwan/integrationconfig/javascript/queueclientConfig.js
+
+      # Exact monitoring boundaries. The end timestamp is exclusive.
+      MONITOR_START_UTC: "2026-09-22T16:00:00Z"
+      MONITOR_END_UTC: "2026-09-30T16:00:00Z"
+
+      # 2026-09-26 05:00-17:00 Asia/Taipei.
+      ELEVATED_START_UTC: "2026-09-25T21:00:00Z"
+      ELEVATED_END_UTC: "2026-09-26T09:00:00Z"
+
+      NORMAL_CRON: "17,47 * 22-30 9 *"
+      STATE_HASH_FILE: state/queueclientConfig.sha256
+      STATE_LAST_MODIFIED_FILE: state/queueclientConfig.last-modified.txt
+      CURRENT_FILE: current/queueclientConfig.js
+      CURRENT_HEADERS_FILE: current/response-headers.txt
+      HISTORY_FILE: monitoring/history.csv
+      DOWNLOAD_FILE: .monitor-work/queueclientConfig.js
+      RESPONSE_HEADERS_FILE: .monitor-work/response-headers.txt
+
+    steps:
+      - name: Check monitoring window and schedule
+        id: gate
+        shell: bash
+        env:
+          TRIGGER_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+
+          now_epoch="$(date -u +%s)"
+          start_epoch="$(date -u -d "$MONITOR_START_UTC" +%s)"
+          end_epoch="$(date -u -d "$MONITOR_END_UTC" +%s)"
+          elevated_start_epoch="$(date -u -d "$ELEVATED_START_UTC" +%s)"
+          elevated_end_epoch="$(date -u -d "$ELEVATED_END_UTC" +%s)"
+
+          active=true
+          reason="eligible scheduled or manual run"
+
+          if [ "$now_epoch" -lt "$start_epoch" ] || [ "$now_epoch" -ge "$end_epoch" ]; then
+            active=false
+            reason="outside requested monitoring window"
+          elif [ "${TRIGGER_SCHEDULE:-}" = "$NORMAL_CRON" ] \
+            && [ "$now_epoch" -ge "$elevated_start_epoch" ] \
+            && [ "$now_epoch" -lt "$elevated_end_epoch" ]; then
+            active=false
+            reason="30-minute run suppressed during 5-minute monitoring window"
+          fi
+
+          echo "active=$active" >> "$GITHUB_OUTPUT"
+          echo "reason=$reason" >> "$GITHUB_OUTPUT"
+          echo "$reason"
+
+      - name: Check out repository
+        if: steps.gate.outputs.active == 'true'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download with cache busting
+        if: steps.gate.outputs.active == 'true'
+        id: download
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p .monitor-work
+
+          cache_buster="$(date -u '+%Y%m%d%H%M%S%N')"
+          request_url="${TARGET_URL}?versionTimestamp=${cache_buster}"
+
+          http_status="$(curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 20 \
+            --max-time 60 \
+            --header 'Cache-Control: no-cache' \
+            --header 'Pragma: no-cache' \
+            --user-agent 'Mozilla/5.0 QueueConfigMonitor/1.0' \
+            --dump-header "$RESPONSE_HEADERS_FILE" \
+            --output "$DOWNLOAD_FILE" \
+            --write-out '%{http_code}' \
+            "$request_url")"
+
+          test -s "$DOWNLOAD_FILE"
+
+          if grep -Eiq '^\s*<!doctype html|^\s*<html' "$DOWNLOAD_FILE"; then
+            echo "Downloaded content appears to be HTML instead of JavaScript." >&2
+            exit 1
+          fi
+
+          echo "request_url=$request_url" >> "$GITHUB_OUTPUT"
+          echo "http_status=$http_status" >> "$GITHUB_OUTPUT"
+
+          echo "Relevant response headers:"
+          grep -Ei '^(HTTP/|age:|cache-control:|content-length:|content-type:|date:|etag:|expires:|last-modified:|via:|x-cache:)' \
+            "$RESPONSE_HEADERS_FILE" || true
+
+      - name: Compare hash and save metadata
+        if: steps.gate.outputs.active == 'true'
+        id: compare
+        shell: bash
+        env:
+          REQUEST_URL: ${{ steps.download.outputs.request_url }}
+          HTTP_STATUS: ${{ steps.download.outputs.http_status }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p state current archive monitoring
+
+          header_value() {
+            local name="$1"
+            awk -v target="$name" '
+              BEGIN {IGNORECASE=1}
+              {
+                line=$0
+                sub(/\r$/, "", line)
+                if (tolower(line) ~ "^" tolower(target) ":[[:space:]]*") {
+                  sub(/^[^:]*:[[:space:]]*/, "", line)
+                  value=line
+                }
+              }
+              END {print value}
+            ' "$RESPONSE_HEADERS_FILE"
+          }
+
+          csv_escape() {
+            local value="${1//$'\r'/}"
+            value="${value//\"/\"\"}"
+            printf '"%s"' "$value"
+          }
+
+          checked_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          file_timestamp="$(date -u '+%Y-%m-%dT%H-%M-%SZ')"
+          last_modified="$(header_value 'last-modified')"
+          etag="$(header_value 'etag')"
+          content_type="$(header_value 'content-type')"
+          current_hash="$(sha256sum "$DOWNLOAD_FILE" | awk '{print $1}')"
+          previous_hash="$(cat "$STATE_HASH_FILE" 2>/dev/null || true)"
+
+          if [ -z "$previous_hash" ]; then
+            status="baseline"
+          elif [ "$current_hash" != "$previous_hash" ]; then
+            status="changed"
+          else
+            status="unchanged"
+          fi
+
+          if [ ! -f "$HISTORY_FILE" ]; then
+            printf '%s\n' \
+              'checked_at_utc,last_modified,etag,sha256,status,http_status,content_type,request_url' \
+              > "$HISTORY_FILE"
+          fi
+
+          printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+            "$(csv_escape "$checked_at")" \
+            "$(csv_escape "$last_modified")" \
+            "$(csv_escape "$etag")" \
+            "$(csv_escape "$current_hash")" \
+            "$(csv_escape "$status")" \
+            "$(csv_escape "$HTTP_STATUS")" \
+            "$(csv_escape "$content_type")" \
+            "$(csv_escape "$REQUEST_URL")" \
+            >> "$HISTORY_FILE"
+
+          # Store only selected, non-sensitive response headers publicly.
+          grep -Ei '^(age:|cache-control:|content-length:|content-type:|date:|etag:|expires:|last-modified:|via:|x-cache:)' \
+            "$RESPONSE_HEADERS_FILE" > "$CURRENT_HEADERS_FILE" || true
+
+          printf '%s\n' "$last_modified" > "$STATE_LAST_MODIFIED_FILE"
+
+          archive_file=""
+          metadata_file=""
+
+          if [ "$status" = "baseline" ] || [ "$status" = "changed" ]; then
+            short_hash="${current_hash:0:12}"
+            archive_file="archive/queueclientConfig_${file_timestamp}_${short_hash}.js"
+            metadata_file="${archive_file%.js}.metadata.json"
+
+            cp "$DOWNLOAD_FILE" "$CURRENT_FILE"
+            cp "$DOWNLOAD_FILE" "$archive_file"
+            printf '%s\n' "$current_hash" > "$STATE_HASH_FILE"
+
+            jq -n \
+              --arg checkedAtUtc "$checked_at" \
+              --arg sourceUrl "$TARGET_URL" \
+              --arg requestUrl "$REQUEST_URL" \
+              --arg lastModified "$last_modified" \
+              --arg etag "$etag" \
+              --arg sha256 "$current_hash" \
+              --arg httpStatus "$HTTP_STATUS" \
+              --arg contentType "$content_type" \
+              --arg status "$status" \
+              '{checkedAtUtc: $checkedAtUtc, sourceUrl: $sourceUrl,
+                requestUrl: $requestUrl, lastModified: $lastModified,
+                etag: $etag, sha256: $sha256, httpStatus: $httpStatus,
+                contentType: $contentType, status: $status}' \
+              > "$metadata_file"
+          fi
+
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          echo "checked_at=$checked_at" >> "$GITHUB_OUTPUT"
+          echo "last_modified=$last_modified" >> "$GITHUB_OUTPUT"
+          echo "previous_hash=$previous_hash" >> "$GITHUB_OUTPUT"
+          echo "current_hash=$current_hash" >> "$GITHUB_OUTPUT"
+          echo "archive_file=$archive_file" >> "$GITHUB_OUTPUT"
+          echo "metadata_file=$metadata_file" >> "$GITHUB_OUTPUT"
+
+          echo "Status: $status"
+          echo "Last-Modified: ${last_modified:-not supplied}"
+          echo "SHA-256: $current_hash"
+
+      - name: Commit monitoring record and saved copy
+        if: steps.gate.outputs.active == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git config user.name "queue-it-monitor"
+          git config user.email "queue-it-monitor@users.noreply.github.com"
+
+          git add monitoring state current archive
+
+          if git diff --cached --quiet; then
+            echo "No repository changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Monitor Queue-it config ${{ steps.compare.outputs.checked_at }}"
+          git pull --rebase origin "$GITHUB_REF_NAME"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+
+      - name: Stage changed files for artifact
+        if: steps.gate.outputs.active == 'true' && steps.compare.outputs.status == 'changed'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .artifact
+          cp "${{ steps.compare.outputs.archive_file }}" .artifact/
+          cp "${{ steps.compare.outputs.metadata_file }}" .artifact/
+
+      - name: Upload changed copy as workflow artifact
+        if: steps.gate.outputs.active == 'true' && steps.compare.outputs.status == 'changed'
+        uses: actions/upload-artifact@v4
+        with:
+          name: queueclientConfig-${{ github.run_id }}
+          path: .artifact/
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Open GitHub issue when content changes
+        if: steps.gate.outputs.active == 'true' && steps.compare.outputs.status == 'changed'
+        uses: actions/github-script@v7
+        env:
+          DETECTED_AT: ${{ steps.compare.outputs.checked_at }}
+          LAST_MODIFIED: ${{ steps.compare.outputs.last_modified }}
+          PREVIOUS_HASH: ${{ steps.compare.outputs.previous_hash }}
+          CURRENT_HASH: ${{ steps.compare.outputs.current_hash }}
+          ARCHIVE_FILE: ${{ steps.compare.outputs.archive_file }}
+          METADATA_FILE: ${{ steps.compare.outputs.metadata_file }}
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const branch = context.ref.replace("refs/heads/", "");
+            const archiveUrl = `${context.serverUrl}/${owner}/${repo}/blob/${branch}/${process.env.ARCHIVE_FILE}`;
+            const metadataUrl = `${context.serverUrl}/${owner}/${repo}/blob/${branch}/${process.env.METADATA_FILE}`;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            await github.rest.issues.create({
+              owner,
+              repo,
+              title: `Queue-it configuration changed at ${process.env.DETECTED_AT}`,
+              body: [
+                "The monitored Queue-it configuration file changed.",
+                "",
+                `- **Observed at:** \`${process.env.DETECTED_AT}\``,
+                `- **Last-Modified:** \`${process.env.LAST_MODIFIED || "not supplied"}\``,
+                `- **Previous SHA-256:** \`${process.env.PREVIOUS_HASH}\``,
+                `- **Current SHA-256:** \`${process.env.CURRENT_HASH}\``,
+                `- [Saved JavaScript](${archiveUrl})`,
+                `- [Saved metadata](${metadataUrl})`,
+                `- [Workflow run and artifact](${runUrl})`
+              ].join("\n")
+            });
+
+      - name: Report skipped run
+        if: steps.gate.outputs.active != 'true'
+        run: echo "No request made because this run was ${{ steps.gate.outputs.reason }}."
